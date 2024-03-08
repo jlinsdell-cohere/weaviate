@@ -432,7 +432,7 @@ func (st *Store) Snapshot() (raft.FSMSnapshot, error) {
 // concurrently with any other command. The FSM must discard all previous
 // state before restoring the snapshot.
 func (st *Store) Restore(rc io.ReadCloser) error {
-	st.log.Info("restoring snapshot")
+	st.log.Info("restoring db from snapshot")
 	defer func() {
 		if err := rc.Close(); err != nil {
 			st.log.Error("restore snapshot: close reader: " + err.Error())
@@ -440,7 +440,21 @@ func (st *Store) Restore(rc io.ReadCloser) error {
 	}()
 
 	if err := st.db.Schema.Restore(rc, st.db.parser); err != nil {
-		return fmt.Errorf("restore snapshot: %w", err)
+		st.log.Error("restoring schema from snapshot: " + err.Error())
+		return fmt.Errorf("restore schema from snapshot: %w", err)
+	}
+
+	ctx := context.Background()
+	st.log.Info("restoring snapshot: load database")
+
+	if st.dbLoaded.Load() {
+		st.dbLoaded.Store(false)
+		if err := st.db.Close(ctx); err != nil {
+			st.log.Error("restore schema from snapshot: close db " + err.Error())
+			return fmt.Errorf("restore schema from snapshot: close db: %w", err)
+		}
+
+		st.loadDatabase(ctx)
 	}
 
 	// TODO-RAFT START
