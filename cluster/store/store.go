@@ -48,7 +48,7 @@ const (
 	// This is used to reduce disk I/O for the recently committed entries.
 	logCacheCapacity = 512
 
-	nRetainedSnapShots = 1
+	nRetainedSnapShots = 3
 )
 
 var (
@@ -219,8 +219,8 @@ func (st *Store) Open(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("read log last command: %w", err)
 	}
-
-	if st.initialLastAppliedIndex == snapshotIndex(snapshotStore) {
+	lastSnapshotIndex := snapshotIndex(snapshotStore)
+	if st.initialLastAppliedIndex == 0 && lastSnapshotIndex == 0 {
 		st.loadDatabase(ctx)
 	}
 
@@ -230,8 +230,10 @@ func (st *Store) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("raft.NewRaft %v %w", address, err)
 	}
 
-	st.log.Info("starting raft", "applied_index", st.raft.AppliedIndex(), "last_index",
-		st.raft.LastIndex(), "last_log_index", st.initialLastAppliedIndex)
+	st.log.Info("starting raft", "applied_index",
+		st.raft.AppliedIndex(), "last_index",
+		st.raft.LastIndex(), "last_log_index", st.initialLastAppliedIndex,
+		"last_snapshot_index", lastSnapshotIndex)
 
 	go func() {
 		lastLeader := "Unknown"
@@ -445,8 +447,8 @@ func (st *Store) Restore(rc io.ReadCloser) error {
 
 	st.log.Info("restoring snapshot: load database")
 
-	// if the db is already loaded, it will be reloaded.
 	st.reloadDB()
+	st.log.Info("database has been successfully reloaded", "n", st.db.Schema.Len())
 
 	return nil
 }
@@ -548,6 +550,7 @@ func (st *Store) raftConfig() *raft.Config {
 	if st.snapshotThreshold > 0 {
 		cfg.SnapshotThreshold = st.snapshotThreshold
 	}
+
 	cfg.LocalID = raft.ServerID(st.nodeID)
 	cfg.LogLevel = st.logLevel
 	return cfg
@@ -563,29 +566,30 @@ func (st *Store) loadDatabase(ctx context.Context) {
 	}
 
 	st.dbLoaded.Store(true)
-	st.log.Info("database has been successfully loaded")
+	st.log.Info("database has been successfully loaded", "n", st.db.Schema.Len())
 }
 
 // reloadDB: If the DB is already loaded, it will be reloaded. Otherwise,
 // the DB will load when the node synchronizes its state with the leader.
 func (st *Store) reloadDB() {
 	ctx := context.Background()
-	if !st.dbLoaded.CompareAndSwap(true, false) {
-		return
+	swapped := st.dbLoaded.CompareAndSwap(true, false)
+	if swapped {
+		st.log.Info("reload db: closing db ")
+		if err := st.db.Close(ctx); err != nil {
+			st.log.Error("reload db: close db " + err.Error())
+			panic(fmt.Sprintf("reload db from snapshot: close db: %v", err))
+		}
 	}
 
-	if err := st.db.Close(ctx); err != nil {
-		st.log.Error("reload db: close db " + err.Error())
-		panic(fmt.Sprintf("reload db from snapshot: close db: %v", err))
-	}
-
+	st.log.Info("reload db: load db ")
 	if err := st.db.Load(ctx, st.nodeID); err != nil {
 		st.log.Error("cannot reload database: " + err.Error())
 		panic(fmt.Sprintf("cannot reload database: %v", err))
 	}
 
 	st.dbLoaded.Store(true)
-	st.log.Info("database has been successfully reloaded")
+	st.initialLastAppliedIndex = 0
 }
 
 type Response struct {
