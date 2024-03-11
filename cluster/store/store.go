@@ -221,18 +221,20 @@ func (st *Store) Open(ctx context.Context) (err error) {
 	}
 	lastSnapshotIndex := snapshotIndex(snapshotStore)
 	if st.initialLastAppliedIndex == 0 && lastSnapshotIndex == 0 {
+		st.log.Info("load local db")
 		st.loadDatabase(ctx)
 	}
 
-	// raft node
+	st.log.Info("construct a new raft node")
 	st.raft, err = raft.NewRaft(st.raftConfig(), st, logCache, st.logStore, snapshotStore, st.transport)
 	if err != nil {
 		return fmt.Errorf("raft.NewRaft %v %w", address, err)
 	}
 
-	st.log.Info("starting raft", "applied_index",
-		st.raft.AppliedIndex(), "last_index",
-		st.raft.LastIndex(), "last_log_index", st.initialLastAppliedIndex,
+	st.log.Info("raft node",
+		"raft_applied_index", st.raft.AppliedIndex(),
+		"raft_last_index", st.raft.LastIndex(),
+		"last_log_applied_index", st.initialLastAppliedIndex,
 		"last_snapshot_index", lastSnapshotIndex)
 
 	go func() {
@@ -433,7 +435,7 @@ func (st *Store) Snapshot() (raft.FSMSnapshot, error) {
 // concurrently with any other command. The FSM must discard all previous
 // state before restoring the snapshot.
 func (st *Store) Restore(rc io.ReadCloser) error {
-	st.log.Info("restoring db from snapshot")
+	st.log.Info("restoring from snapshot")
 	defer func() {
 		if err := rc.Close(); err != nil {
 			st.log.Error("restore snapshot: close reader: " + err.Error())
@@ -445,10 +447,11 @@ func (st *Store) Restore(rc io.ReadCloser) error {
 		return fmt.Errorf("restore schema from snapshot: %w", err)
 	}
 
-	st.log.Info("restoring snapshot: load database")
+	st.log.Info("successfully restored schema from snapshot")
 
-	st.reloadDB()
-	st.log.Info("database has been successfully reloaded", "n", st.db.Schema.Len())
+	if st.reloadDB() {
+		st.log.Info("successfully reloaded indexes from snapshot", "n", st.db.Schema.Len())
+	}
 
 	return nil
 }
@@ -569,20 +572,22 @@ func (st *Store) loadDatabase(ctx context.Context) {
 	st.log.Info("database has been successfully loaded", "n", st.db.Schema.Len())
 }
 
-// reloadDB: If the DB is already loaded, it will be reloaded. Otherwise,
+// reloadDB: If the node DB is already loaded, it will be reloaded. Otherwise,
 // the DB will load when the node synchronizes its state with the leader.
-func (st *Store) reloadDB() {
+// See apply() -> loadDatabase()
+func (st *Store) reloadDB() bool {
 	ctx := context.Background()
-	swapped := st.dbLoaded.CompareAndSwap(true, false)
-	if swapped {
-		st.log.Info("reload db: closing db ")
-		if err := st.db.Close(ctx); err != nil {
-			st.log.Error("reload db: close db " + err.Error())
-			panic(fmt.Sprintf("reload db from snapshot: close db: %v", err))
-		}
+	if !st.dbLoaded.CompareAndSwap(true, false) {
+		return false // this would the case of a local snapshot
 	}
 
-	st.log.Info("reload db: load db ")
+	st.log.Info("reload local db: closing db ...")
+	if err := st.db.Close(ctx); err != nil {
+		st.log.Error("reload db: close db " + err.Error())
+		panic(fmt.Sprintf("reload db from snapshot: close db: %v", err))
+	}
+
+	st.log.Info("reload local db: loading indexes ...")
 	if err := st.db.Load(ctx, st.nodeID); err != nil {
 		st.log.Error("cannot reload database: " + err.Error())
 		panic(fmt.Sprintf("cannot reload database: %v", err))
@@ -590,6 +595,7 @@ func (st *Store) reloadDB() {
 
 	st.dbLoaded.Store(true)
 	st.initialLastAppliedIndex = 0
+	return true
 }
 
 type Response struct {
