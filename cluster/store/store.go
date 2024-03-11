@@ -235,11 +235,10 @@ func (st *Store) Open(ctx context.Context) (err error) {
 
 	go func() {
 		lastLeader := "Unknown"
-		t := time.NewTicker(time.Second * 30)
+		t := time.NewTicker(time.Second * 60)
 		defer t.Stop()
 		for range t.C {
-			leader := st.Leader()
-			if leader != lastLeader {
+			if leader := st.Leader(); leader != "" && leader != lastLeader {
 				lastLeader = leader
 				st.log.Info("current Leader", "address", lastLeader)
 			}
@@ -444,24 +443,11 @@ func (st *Store) Restore(rc io.ReadCloser) error {
 		return fmt.Errorf("restore schema from snapshot: %w", err)
 	}
 
-	ctx := context.Background()
 	st.log.Info("restoring snapshot: load database")
 
-	if st.dbLoaded.Load() {
-		st.dbLoaded.Store(false)
-		if err := st.db.Close(ctx); err != nil {
-			st.log.Error("restore schema from snapshot: close db " + err.Error())
-			return fmt.Errorf("restore schema from snapshot: close db: %w", err)
-		}
+	// if the db is already loaded, it will be reloaded.
+	st.reloadDB()
 
-		st.loadDatabase(ctx)
-	}
-
-	// TODO-RAFT START
-	// In some cases, when the follower state is too far behind the leader's log, the leader might decide to send a snapshot.
-	// Consequently, the follower needs to update its state accordingly.
-	// Task: https://semi-technology.atlassian.net/browse/WVT-42
-	//
 	return nil
 }
 
@@ -578,6 +564,28 @@ func (st *Store) loadDatabase(ctx context.Context) {
 
 	st.dbLoaded.Store(true)
 	st.log.Info("database has been successfully loaded")
+}
+
+// reloadDB: If the DB is already loaded, it will be reloaded. Otherwise,
+// the DB will load when the node synchronizes its state with the leader.
+func (st *Store) reloadDB() {
+	ctx := context.Background()
+	if !st.dbLoaded.CompareAndSwap(true, false) {
+		return
+	}
+
+	if err := st.db.Close(ctx); err != nil {
+		st.log.Error("reload db: close db " + err.Error())
+		panic(fmt.Sprintf("reload db from snapshot: close db: %v", err))
+	}
+
+	if err := st.db.Load(ctx, st.nodeID); err != nil {
+		st.log.Error("cannot reload database: " + err.Error())
+		panic(fmt.Sprintf("cannot reload database: %v", err))
+	}
+
+	st.dbLoaded.Store(true)
+	st.log.Info("database has been successfully reloaded")
 }
 
 type Response struct {
