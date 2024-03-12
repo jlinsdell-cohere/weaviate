@@ -374,7 +374,7 @@ func (st *Store) Apply(l *raft.Log) interface{} {
 
 	schemaOnly := l.Index <= st.initialLastAppliedIndex
 	defer func() {
-		if l.Index >= st.initialLastAppliedIndex {
+		if !st.dbLoaded.Load() && l.Index >= st.initialLastAppliedIndex {
 			st.loadDatabase(context.Background())
 		}
 		if ret.Error != nil {
@@ -584,11 +584,12 @@ func (st *Store) loadDatabase(ctx context.Context) {
 func (st *Store) reloadDB() bool {
 	ctx := context.Background()
 	if !st.dbLoaded.CompareAndSwap(true, false) {
-		// applied index from the log matches the one from the raft
-		if st.initialLastAppliedIndex == st.raft.AppliedIndex() {
+		// the snapshot already includes the state from the raft log
+		if st.initialLastAppliedIndex <= st.raft.AppliedIndex() {
 			st.loadDatabase(ctx)
-			return false
+			return true
 		}
+		return false
 	}
 
 	st.log.Info("reload local db: closing db ...")
