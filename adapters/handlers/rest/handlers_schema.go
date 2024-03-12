@@ -24,7 +24,7 @@ import (
 )
 
 type schemaHandlers struct {
-	manager             *schemaUC.Manager
+	manager             *schemaUC.ManagerWithConsistency
 	metricRequestsTotal restApiRequestsTotal
 }
 
@@ -76,7 +76,7 @@ func (s *schemaHandlers) updateClass(params schema.SchemaObjectsUpdateParams,
 func (s *schemaHandlers) getClass(params schema.SchemaObjectsGetParams,
 	principal *models.Principal,
 ) middleware.Responder {
-	class, err := s.manager.GetClass(params.HTTPRequest.Context(), principal, params.ClassName)
+	class, err := s.manager.GetClass(params.HTTPRequest.Context(), principal, params.ClassName, *params.Consistency)
 	if err != nil {
 		s.metricRequestsTotal.logError(params.ClassName, err)
 		switch err.(type) {
@@ -327,7 +327,8 @@ func (s *schemaHandlers) tenantExists(params schema.TenantExistsParams, principa
 }
 
 func setupSchemaHandlers(api *operations.WeaviateAPI, manager *schemaUC.Manager, metrics *monitoring.PrometheusMetrics, logger logrus.FieldLogger) {
-	h := &schemaHandlers{manager, newSchemaRequestsTotal(metrics, logger)}
+	schemaManagerWithConsistency := schemaUC.NewManagerWithConsistency(manager)
+	h := &schemaHandlers{&schemaManagerWithConsistency, newSchemaRequestsTotal(metrics, logger)}
 
 	api.SchemaSchemaObjectsCreateHandler = schema.
 		SchemaObjectsCreateHandlerFunc(h.addClass)
