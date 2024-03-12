@@ -220,8 +220,7 @@ func (st *Store) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("read log last command: %w", err)
 	}
 	lastSnapshotIndex := snapshotIndex(snapshotStore)
-	if st.initialLastAppliedIndex == 0 && lastSnapshotIndex == 0 {
-		st.log.Info("load local db")
+	if st.initialLastAppliedIndex == 0 { // empty node
 		st.loadDatabase(ctx)
 	}
 
@@ -563,6 +562,8 @@ func (st *Store) loadDatabase(ctx context.Context) {
 	if st.dbLoaded.Load() {
 		return
 	}
+	st.log.Info("loading local db")
+
 	if err := st.db.Load(ctx, st.nodeID); err != nil {
 		st.log.Error("cannot restore database: " + err.Error())
 		panic("error restoring database")
@@ -575,13 +576,23 @@ func (st *Store) loadDatabase(ctx context.Context) {
 // reloadDB: If the node DB is already loaded, it will be reloaded. Otherwise,
 // the DB will load when the node synchronizes its state with the leader.
 // See apply() -> loadDatabase()
+// reloadDB reloads the node's local db. If the db is already loaded, it will be reloaded.
+// If a snapshot exists and its is up to date with the log, it will be loaded.
+// Otherwise, the database will be loaded when the node synchronizes its state with the leader.
+// For more details, see apply() -> loadDatabase().
+
 func (st *Store) reloadDB() bool {
 	ctx := context.Background()
 	if !st.dbLoaded.CompareAndSwap(true, false) {
-		return false // this would the case of a local snapshot
+		// applied index from the log matches the one from the raft
+		if st.initialLastAppliedIndex == st.raft.AppliedIndex() {
+			st.loadDatabase(ctx)
+			return false
+		}
 	}
 
 	st.log.Info("reload local db: closing db ...")
+
 	if err := st.db.Close(ctx); err != nil {
 		st.log.Error("reload db: close db " + err.Error())
 		panic(fmt.Sprintf("reload db from snapshot: close db: %v", err))
