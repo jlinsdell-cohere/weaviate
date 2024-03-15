@@ -131,10 +131,11 @@ type Store struct {
 	log      *slog.Logger
 	logLevel string
 
-	bootstrapped atomic.Bool
-	logStore     *raftbolt.BoltStore
-	addResolver  *addrResolver
-	transport    *raft.NetworkTransport
+	bootstrapped  atomic.Bool
+	logStore      *raftbolt.BoltStore
+	addResolver   *addrResolver
+	transport     *raft.NetworkTransport
+	snapshotStore *raft.FileSnapshotStore
 
 	mutex      sync.Mutex
 	candidates map[string]string
@@ -195,7 +196,7 @@ func (st *Store) Open(ctx context.Context) (err error) {
 	}
 
 	// file snapshot store
-	snapshotStore, err := raft.NewFileSnapshotStore(st.raftDir, nRetainedSnapShots, os.Stdout)
+	st.snapshotStore, err = raft.NewFileSnapshotStore(st.raftDir, nRetainedSnapShots, os.Stdout)
 	if err != nil {
 		return fmt.Errorf("raft: file snapshot store: %w", err)
 	}
@@ -219,13 +220,13 @@ func (st *Store) Open(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("read log last command: %w", err)
 	}
-	lastSnapshotIndex := snapshotIndex(snapshotStore)
+	lastSnapshotIndex := snapshotIndex(st.snapshotStore)
 	if st.initialLastAppliedIndex == 0 { // empty node
 		st.loadDatabase(ctx)
 	}
 
 	st.log.Info("construct a new raft node")
-	st.raft, err = raft.NewRaft(st.raftConfig(), st, logCache, st.logStore, snapshotStore, st.transport)
+	st.raft, err = raft.NewRaft(st.raftConfig(), st, logCache, st.logStore, st.snapshotStore, st.transport)
 	if err != nil {
 		return fmt.Errorf("raft.NewRaft %v %w", address, err)
 	}
@@ -374,6 +375,9 @@ func (st *Store) Apply(l *raft.Log) interface{} {
 
 	schemaOnly := l.Index <= st.initialLastAppliedIndex
 	defer func() {
+		// If the local db has not been loaded, wait until we reach the state
+		// from the local raft log before loading the db.
+		// This is necessary because the database operations are not idempotent
 		if !st.dbLoaded.Load() && l.Index >= st.initialLastAppliedIndex {
 			st.loadDatabase(context.Background())
 		}
@@ -583,9 +587,13 @@ func (st *Store) loadDatabase(ctx context.Context) {
 
 func (st *Store) reloadDB() bool {
 	ctx := context.Background()
+
 	if !st.dbLoaded.CompareAndSwap(true, false) {
 		// the snapshot already includes the state from the raft log
-		if st.initialLastAppliedIndex <= st.raft.AppliedIndex() {
+		snapIndex := snapshotIndex(st.snapshotStore)
+		st.log.Info("load local db", "last_log_applied_index",
+			st.initialLastAppliedIndex, "last_snapshot_index", snapIndex)
+		if st.initialLastAppliedIndex <= snapIndex {
 			st.loadDatabase(ctx)
 			return true
 		}
